@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(python3 -c \"\nimport paramiko\nimport sys\n\nHOST = ''192.168.1.218''\nUSER = ''RPM''\nPASS = ''RPM''\n\ntry:\n    client = paramiko.SSHClient\\(\\)\n    client.set_missing_host_key_policy\\(paramiko.AutoAddPolicy\\(\\)\\)\n    client.connect\\(HOST, username=USER, password=PASS, timeout=10\\)\n    \n    print\\(''=== 1. Check sclibridge available commands ===''\\)\n    cmd = ''LD_LIBRARY_PATH=/usr/local/lib /usr/local/bin/sclibridge help 2>&1''\n    stdin, stdout, stderr = client.exec_command\\(cmd, timeout=10\\)\n    print\\(stdout.read\\(\\).decode\\(''utf-8''\\)\\)\n    \n    print\\(''\\\\n=== 2. List user zones ===''\\)\n    cmd = ''LD_LIBRARY_PATH=/usr/local/lib timeout 5 /usr/local/bin/sclibridge userzones 2>&1''\n    stdin, stdout, stderr = client.exec_command\\(cmd, timeout=10\\)\n    print\\(stdout.read\\(\\).decode\\(''utf-8''\\)\\)\n    \n    client.close\\(\\)\nexcept Exception as e:\n    print\\(f''Error: {e}''\\)\n\")",
+      "Bash(ping:*)",
+      "Bash(nc:*)",
+      "Bash(python3:*)",
+      "Bash(ssh RPM@192.168.1.218:*)"
+    ]
+  }
+}

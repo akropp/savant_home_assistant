@@ -1,0 +1,11 @@
+{
+  "domain": "savant_control",
+  "name": "Savant Control",
+  "documentation": "https://github.com/adam/savant_control",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": [
+    "requests>=2.0"
+  ],
+  "version": "1.0.0"
+}
