@@ -42,6 +42,17 @@ class SavantClient:
             _LOGGER.error(f"Failed to get lights: {e}")
             return []
 
+    def get_state(self):
+        """Retrieve current state of all components from the REST Relay."""
+        try:
+            response = requests.get(f"{self._base_url}/state", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('components', {})
+        except Exception as e:
+            _LOGGER.error(f"Failed to get state: {e}")
+            return {}
+
     def get_services(self, zone_name):
         """Return a list of services for a given zone."""
         if zone_name in self._zones:

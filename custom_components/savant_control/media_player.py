@@ -7,10 +7,14 @@ from homeassistant.components.media_player import (
     MediaPlayerDeviceClass,
 )
 from homeassistant.const import STATE_ON, STATE_OFF, STATE_IDLE
+from homeassistant.core import HomeAssistant
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+# Polling interval in seconds
+SCAN_INTERVAL = 10
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the Savant Media Player platform."""
@@ -38,14 +42,22 @@ class SavantMediaPlayer(MediaPlayerEntity):
         self._name = f"Savant {zone_name}"
         self._state = STATE_IDLE
         self._source = None
+        self._volume_level = None
+        self._is_muted = None
+
+        # Unique ID for the entity
+        self._attr_unique_id = f"savant_media_{zone_name}".replace(" ", "_").lower()
 
         # Services from relay: list of dicts with alias, type, component,
         # logicalComponent, serviceVariantID, service
         raw_services = zone_data.get('services', [])
         self._services = {}
+        self._components = set()  # Track component names for state lookup
         for svc in raw_services:
             if isinstance(svc, dict) and svc.get('alias'):
                 self._services[svc['alias']] = svc
+                if svc.get('component'):
+                    self._components.add(svc['component'])
 
         self._source_list = sorted(list(self._services.keys()))
 
@@ -91,6 +103,16 @@ class SavantMediaPlayer(MediaPlayerEntity):
         return self._source_list
 
     @property
+    def volume_level(self) -> Optional[float]:
+        """Return the volume level (0.0 to 1.0)."""
+        return self._volume_level
+
+    @property
+    def is_volume_muted(self) -> Optional[bool]:
+        """Return True if volume is muted."""
+        return self._is_muted
+
+    @property
     def supported_features(self):
         features = (
             MediaPlayerEntityFeature.TURN_ON
@@ -107,6 +129,54 @@ class SavantMediaPlayer(MediaPlayerEntity):
     @property
     def device_class(self):
         return MediaPlayerDeviceClass.SPEAKER
+
+    def update(self):
+        """Fetch state from the relay."""
+        try:
+            all_states = self._client.get_state()
+
+            # Check each component in this zone for power/volume/mute state
+            power_on = False
+            volume = None
+            muted = None
+
+            for component_name in self._components:
+                if component_name in all_states:
+                    states = all_states[component_name]
+
+                    # Check power state
+                    for key, value in states.items():
+                        key_lower = key.lower()
+                        if 'power' in key_lower:
+                            if str(value).upper() == 'ON':
+                                power_on = True
+
+                        # Check volume (look for keys containing 'volume')
+                        if 'volume' in key_lower and 'rpm' not in key_lower:
+                            try:
+                                vol_val = int(value)
+                                # Assume 0-100 scale, convert to 0.0-1.0
+                                volume = min(1.0, max(0.0, vol_val / 100.0))
+                            except (ValueError, TypeError):
+                                pass
+
+                        # Check mute state
+                        if 'mute' in key_lower:
+                            muted = str(value).upper() == 'ON'
+
+            # Update state
+            if power_on:
+                self._state = STATE_ON
+            else:
+                self._state = STATE_OFF
+
+            if volume is not None:
+                self._volume_level = volume
+            if muted is not None:
+                self._is_muted = muted
+
+        except Exception as e:
+            _LOGGER.error(f"Error updating state for {self._name}: {e}")
 
     def _send_service_command(self, service_info, command):
         """Send a command for a service."""

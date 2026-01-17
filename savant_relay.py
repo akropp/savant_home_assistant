@@ -6,11 +6,64 @@ import socket
 import subprocess
 import sys
 import re
+import os
+import glob
+import xml.etree.ElementTree as ET
 
 # Config
 DB_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/serviceImplementation.sqlite'
+STATUS_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles'
 SAVANT_HOST = '127.0.0.1'
 LISTEN_PORT = 8081
+
+
+def parse_gnustep_plist(filepath):
+    """Parse a GNUstep plist file and return the States dict."""
+    try:
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+
+        # Find the main dict
+        main_dict = root.find('dict')
+        if main_dict is None:
+            return {}
+
+        # Parse dict into Python dict
+        def parse_dict(dict_elem):
+            result = {}
+            keys = dict_elem.findall('key')
+            for key_elem in keys:
+                key = key_elem.text
+                # Get the next sibling element (the value)
+                next_elem = None
+                found_key = False
+                for child in dict_elem:
+                    if found_key:
+                        next_elem = child
+                        break
+                    if child == key_elem:
+                        found_key = True
+
+                if next_elem is None:
+                    continue
+
+                if next_elem.tag == 'string':
+                    result[key] = next_elem.text or ''
+                elif next_elem.tag == 'integer':
+                    result[key] = int(next_elem.text) if next_elem.text else 0
+                elif next_elem.tag == 'real':
+                    result[key] = float(next_elem.text) if next_elem.text else 0.0
+                elif next_elem.tag == 'dict':
+                    result[key] = parse_dict(next_elem)
+                elif next_elem.tag == 'array':
+                    result[key] = [parse_dict(d) if d.tag == 'dict' else d.text for d in next_elem]
+            return result
+
+        data = parse_dict(main_dict)
+        return data.get('States', {})
+    except Exception as e:
+        print "Error parsing plist %s: %s" % (filepath, e)
+        return {}
 
 def discover_uis_port():
     """Discover UIS port via Avahi/Bonjour."""
@@ -45,6 +98,8 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.handle_zones()
         elif self.path == '/lights':
             self.handle_lights()
+        elif self.path == '/state':
+            self.handle_state()
         else:
             self.send_error(404)
 
@@ -191,6 +246,41 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         except Exception as e:
             print "Lights query error:", e
+            self.send_error(500, str(e))
+
+    def handle_state(self):
+        """Return current state of all components from avc.plist files."""
+        try:
+            components = {}
+
+            # Find all .avc.plist files
+            plist_pattern = os.path.join(STATUS_PATH, '*.avc.plist')
+            for plist_file in glob.glob(plist_pattern):
+                # Extract component name from filename
+                filename = os.path.basename(plist_file)
+                component_name = filename.replace('.avc.plist', '')
+
+                # Parse the plist and get states
+                states = parse_gnustep_plist(plist_file)
+
+                # Filter out non-state keys (like SavantHost*, login, password, etc)
+                filtered_states = {}
+                for key, value in states.items():
+                    # Skip internal/config keys
+                    if key.startswith('SavantHost') or key in ('login', 'password', 'ComponentProfileVersion', 'Version'):
+                        continue
+                    filtered_states[key] = value
+
+                if filtered_states:
+                    components[component_name] = filtered_states
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'components': components}))
+
+        except Exception as e:
+            print "State query error:", e
             self.send_error(500, str(e))
 
     def handle_command(self):
