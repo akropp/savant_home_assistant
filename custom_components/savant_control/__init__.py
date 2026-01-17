@@ -38,7 +38,8 @@ def setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["client"] = client
 
-    # Load media_player platform
+    # Load platforms
     hass.helpers.discovery.load_platform("media_player", DOMAIN, {}, config)
+    hass.helpers.discovery.load_platform("light", DOMAIN, {}, config)
 
     return True

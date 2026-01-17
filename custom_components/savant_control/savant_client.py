@@ -19,12 +19,27 @@ class SavantClient:
             response = requests.get(f"{self._base_url}/zones", timeout=10)
             response.raise_for_status()
             data = response.json()
-            
+
             self._zones = data.get('zones', {})
             _LOGGER.info(f"Discovery complete. Found {len(self._zones)} zones.")
             return self._zones
         except Exception as e:
             _LOGGER.error(f"Failed to get zones: {e}")
+            return []
+
+    def get_lights(self):
+        """Retrieve light entities from the REST Relay."""
+        _LOGGER.info("Getting lights from Savant Relay...")
+        try:
+            response = requests.get(f"{self._base_url}/lights", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            lights = data.get('lights', [])
+            _LOGGER.info(f"Found {len(lights)} lights.")
+            return lights
+        except Exception as e:
+            _LOGGER.error(f"Failed to get lights: {e}")
             return []
 
     def get_services(self, zone_name):
@@ -33,7 +48,7 @@ class SavantClient:
             return self._zones[zone_name]['services']
         return []
 
-    def send_command(self, zone, component, logical_component, service, variant_id, command):
+    def send_command(self, zone, component, logical_component, service, variant_id, command, arguments=None):
         """Send a command via REST to Relay.
 
         Args:
@@ -42,7 +57,8 @@ class SavantClient:
             logical_component: Logical component (e.g., "Lighting_controller")
             service: Service type (e.g., "SVC_ENV_LIGHTING")
             variant_id: Service variant ID (e.g., "1")
-            command: Command to execute (e.g., "AllLightsOn")
+            command: Command to execute (e.g., "DimmerSet")
+            arguments: Optional dict of command arguments (e.g., {"Address1": "14", "DimmerLevel": "100"})
         """
         payload = {
             "zone": zone,
@@ -52,6 +68,8 @@ class SavantClient:
             "serviceVariantID": str(variant_id),
             "command": command
         }
+        if arguments:
+            payload["arguments"] = arguments
         _LOGGER.debug(f"Sending Savant command: {payload}")
         try:
             response = requests.post(
