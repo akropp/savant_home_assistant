@@ -5,6 +5,7 @@ import voluptuous as vol
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import discovery
 
 from .savant_client import SavantClient
 
@@ -39,7 +40,7 @@ def setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN]["client"] = client
 
     # Load platforms
-    hass.helpers.discovery.load_platform("media_player", DOMAIN, {}, config)
-    hass.helpers.discovery.load_platform("light", DOMAIN, {}, config)
+    discovery.load_platform(hass, "media_player", DOMAIN, {}, config)
+    discovery.load_platform(hass, "light", DOMAIN, {}, config)
 
     return True
