@@ -110,6 +110,9 @@ class SavantLight(LightEntity):
         if self._is_dimmer:
             # Get brightness from kwargs, default to 100%
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
+            # If brightness is 0 or very low, use 100% (turning on should actually turn on)
+            if brightness < 3:
+                brightness = 255
             # Convert HA brightness (0-255) to Savant (0-100)
             dimmer_level = round(brightness * 100 / 255)
 
