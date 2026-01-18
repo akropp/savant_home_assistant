@@ -13,8 +13,8 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polling interval
-SCAN_INTERVAL = timedelta(seconds=10)
+# Polling interval - not too aggressive to avoid overwhelming Savant
+SCAN_INTERVAL = timedelta(seconds=30)
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the Savant Media Player platform."""

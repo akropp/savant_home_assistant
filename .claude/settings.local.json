@@ -7,7 +7,19 @@
       "Bash(ping:*)",
       "Bash(nc:*)",
       "Bash(python3:*)",
-      "Bash(ssh RPM@192.168.1.218:*)"
+      "Bash(ssh RPM@192.168.1.218:*)",
+      "Bash(curl:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd README with installation instructions\n\nDocuments relay setup, Home Assistant integration installation,\nconfiguration options, created entities, and troubleshooting tips.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nFix deprecated hass.helpers usage for Home Assistant compatibility\n\nImport discovery module directly instead of using removed hass.helpers accessor.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(scp:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd state polling for media devices\n\n- Add /state endpoint to relay that reads avc.plist files for component state\n- Add get_state method to savant_client.py\n- Add update\\(\\) method to media_player.py to poll power, volume, mute states\n- Media players now show real-time power/volume/mute status from Savant\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nFix media player entity loading\n\n- Fix get_zones\\(\\) to return empty dict on error instead of empty list\n- Fix SCAN_INTERVAL to use timedelta instead of int\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd light state polling via Lutron integration\n\n- Add query_lutron_levels\\(\\) function to relay that queries Lutron RadioRA2\n- Add /lights/status endpoint that returns real-time dimmer levels\n- Add get_light_status\\(\\) method to savant_client.py\n- Add update\\(\\) method to light.py to poll for current state every 10 seconds\n- Lights now show actual on/off state and brightness from Lutron\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(ssh:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd persistent state listeners for real-time updates\n\n- Add StateCache class for thread-safe state caching\n- Add Lutron listener thread for real-time light level updates\n- Add inotify-based plist watcher for media device state changes\n- Update /state and /lights/status endpoints to use cached data\n- Automatic reconnection for Lutron connection drops\n- Fallback to polling if inotify is unavailable\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit:*)"
     ]
   }
 }
