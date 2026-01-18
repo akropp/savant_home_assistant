@@ -16,6 +16,63 @@ STATUS_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statu
 SAVANT_HOST = '127.0.0.1'
 LISTEN_PORT = 8081
 
+# Lutron config (from Lutron.avc.plist)
+LUTRON_HOST = '192.168.1.249'
+LUTRON_PORT = 23
+LUTRON_USER = 'lutron'
+LUTRON_PASS = 'integration'
+
+
+def query_lutron_levels(addresses):
+    """Query Lutron for current output levels.
+
+    Args:
+        addresses: List of Lutron addresses to query
+
+    Returns:
+        Dict mapping address -> level (0-100)
+    """
+    import time
+    levels = {}
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((LUTRON_HOST, LUTRON_PORT))
+
+        # Login sequence
+        time.sleep(0.3)
+        sock.recv(1024)  # login prompt
+        sock.send(LUTRON_USER + '\r\n')
+        time.sleep(0.2)
+        sock.recv(1024)  # password prompt
+        sock.send(LUTRON_PASS + '\r\n')
+        time.sleep(0.2)
+        sock.recv(1024)  # GNET prompt
+
+        # Query each address
+        for addr in addresses:
+            try:
+                sock.send('?OUTPUT,%s,1\r\n' % addr)
+                time.sleep(0.1)
+                response = sock.recv(1024)
+                # Parse response: ~OUTPUT,<addr>,1,<level>
+                for line in response.split('\r\n'):
+                    if line.startswith('~OUTPUT,'):
+                        parts = line.split(',')
+                        if len(parts) >= 4:
+                            resp_addr = parts[1]
+                            level = float(parts[3])
+                            levels[resp_addr] = level
+            except Exception as e:
+                print "Error querying address %s: %s" % (addr, e)
+
+        sock.close()
+    except Exception as e:
+        print "Lutron connection error: %s" % e
+
+    return levels
+
 
 def parse_gnustep_plist(filepath):
     """Parse a GNUstep plist file and return the States dict."""
@@ -98,6 +155,8 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.handle_zones()
         elif self.path == '/lights':
             self.handle_lights()
+        elif self.path == '/lights/status':
+            self.handle_lights_status()
         elif self.path == '/state':
             self.handle_state()
         else:
@@ -246,6 +305,61 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         except Exception as e:
             print "Lights query error:", e
+            self.send_error(500, str(e))
+
+    def handle_lights_status(self):
+        """Return current light levels from Lutron."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+
+            # Get all light addresses
+            query = """
+            SELECT le.addresses, z.name as zone, le.name as light_name
+            FROM LightEntities le
+            JOIN Zones z ON le.zoneID = z.id
+            WHERE le.entityType IN ('Dimmer', 'Switch')
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Build list of addresses to query
+            address_map = {}  # address -> (zone, name)
+            addresses = []
+            for row in rows:
+                addr_str = row[0]
+                zone = row[1]
+                name = row[2]
+                if addr_str:
+                    addr = addr_str.split(',')[0]
+                    addresses.append(addr)
+                    address_map[addr] = {'zone': zone, 'name': name}
+
+            # Query Lutron for current levels
+            levels = query_lutron_levels(addresses)
+
+            # Build response
+            status = {}
+            for addr, info in address_map.items():
+                key = "%s_%s" % (info['zone'], info['name'])
+                key = key.replace(' ', '_').lower()
+                level = levels.get(addr, 0)
+                status[key] = {
+                    'address': addr,
+                    'zone': info['zone'],
+                    'name': info['name'],
+                    'level': level,
+                    'is_on': level > 0
+                }
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'lights': status}))
+
+        except Exception as e:
+            print "Lights status error:", e
             self.send_error(500, str(e))
 
     def handle_state(self):

@@ -1,5 +1,6 @@
 """Savant Light platform for Home Assistant."""
 import logging
+from datetime import timedelta
 from typing import Any, Optional
 
 from homeassistant.components.light import (
@@ -12,6 +13,9 @@ from homeassistant.core import HomeAssistant
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+# Polling interval
+SCAN_INTERVAL = timedelta(seconds=10)
 
 
 async def async_setup_platform(hass: HomeAssistant, config, async_add_entities, discovery_info=None):
@@ -142,3 +146,21 @@ class SavantLight(LightEntity):
         self._is_on = False
         if self._is_dimmer:
             self._brightness = 0
+
+    def update(self):
+        """Fetch current state from Lutron via the relay."""
+        try:
+            all_status = self._client.get_light_status()
+
+            # Build the key that matches how the relay formats it
+            key = f"{self._zone}_{self._light_name}".replace(" ", "_").lower()
+
+            if key in all_status:
+                status = all_status[key]
+                level = status.get('level', 0)
+                self._is_on = level > 0
+                if self._is_dimmer:
+                    # Convert 0-100 to 0-255
+                    self._brightness = round(level * 255 / 100)
+        except Exception as e:
+            _LOGGER.error(f"Error updating light {self.name}: {e}")
