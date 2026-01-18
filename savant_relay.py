@@ -26,6 +26,8 @@ LUTRON_HOST = '192.168.1.249'
 LUTRON_PORT = 23
 LUTRON_USER = 'lutron'
 LUTRON_PASS = 'integration'
+# Disable persistent Lutron connection to avoid blocking Savant's connection
+LUTRON_PERSISTENT = False
 
 # inotify constants
 IN_MODIFY = 0x00000002
@@ -732,9 +734,14 @@ def main():
     plist_thread.daemon = True
     plist_thread.start()
 
-    lutron_thread = threading.Thread(target=lutron_listener_thread)
-    lutron_thread.daemon = True
-    lutron_thread.start()
+    # Only start Lutron listener if enabled (disabled by default to avoid
+    # blocking Savant's connection - Lutron only supports limited connections)
+    if LUTRON_PERSISTENT:
+        lutron_thread = threading.Thread(target=lutron_listener_thread)
+        lutron_thread.daemon = True
+        lutron_thread.start()
+    else:
+        print "Lutron persistent listener disabled (LUTRON_PERSISTENT=False)"
 
     # Give threads a moment to initialize
     time.sleep(1)
