@@ -568,20 +568,19 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def handle_lights_status(self):
-        """Return current light levels from cache (populated by Lutron listener)."""
+        """Return current light levels from Lutron."""
         try:
-            # Get cached light status
-            cached_lights = STATE_CACHE.get_lights()
+            # If persistent listener is running, use cache; otherwise query fresh
+            if LUTRON_PERSISTENT:
+                cached_lights = STATE_CACHE.get_lights()
+                if cached_lights:
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'lights': cached_lights}))
+                    return
 
-            if cached_lights:
-                # Return cached data
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'lights': cached_lights}))
-                return
-
-            # Fallback: query Lutron directly if cache is empty
+            # Query Lutron directly
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
