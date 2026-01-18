@@ -78,7 +78,7 @@ def query_lutron_levels(addresses):
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock.settimeout(5)  # Shorter timeout
         sock.connect((LUTRON_HOST, LUTRON_PORT))
 
         # Login sequence
