@@ -9,6 +9,11 @@ import re
 import os
 import glob
 import xml.etree.ElementTree as ET
+import threading
+import ctypes
+import struct
+import time
+import select
 
 # Config
 DB_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/serviceImplementation.sqlite'
@@ -21,6 +26,40 @@ LUTRON_HOST = '192.168.1.249'
 LUTRON_PORT = 23
 LUTRON_USER = 'lutron'
 LUTRON_PASS = 'integration'
+
+# inotify constants
+IN_MODIFY = 0x00000002
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+
+# Global state cache
+class StateCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.component_states = {}  # component -> {state_key: value}
+        self.light_levels = {}  # key -> {address, zone, name, level, is_on}
+        self.last_update = 0
+
+    def update_component(self, component_name, states):
+        with self.lock:
+            self.component_states[component_name] = states
+            self.last_update = time.time()
+
+    def update_light(self, key, data):
+        with self.lock:
+            self.light_levels[key] = data
+            self.last_update = time.time()
+
+    def get_components(self):
+        with self.lock:
+            return dict(self.component_states)
+
+    def get_lights(self):
+        with self.lock:
+            return dict(self.light_levels)
+
+STATE_CACHE = StateCache()
 
 
 def query_lutron_levels(addresses):
@@ -121,6 +160,225 @@ def parse_gnustep_plist(filepath):
     except Exception as e:
         print "Error parsing plist %s: %s" % (filepath, e)
         return {}
+
+def load_plist_to_cache(filepath):
+    """Load a plist file into the state cache."""
+    filename = os.path.basename(filepath)
+    component_name = filename.replace('.avc.plist', '')
+
+    states = parse_gnustep_plist(filepath)
+
+    # Filter out non-state keys
+    filtered_states = {}
+    for key, value in states.items():
+        if key.startswith('SavantHost') or key in ('login', 'password', 'ComponentProfileVersion', 'Version'):
+            continue
+        filtered_states[key] = value
+
+    if filtered_states:
+        STATE_CACHE.update_component(component_name, filtered_states)
+        print "Updated cache for component: %s (%d states)" % (component_name, len(filtered_states))
+
+
+def plist_watcher_thread():
+    """Background thread that watches plist files for changes using inotify."""
+    print "Starting plist file watcher..."
+
+    # Load initial state
+    plist_pattern = os.path.join(STATUS_PATH, '*.avc.plist')
+    for plist_file in glob.glob(plist_pattern):
+        load_plist_to_cache(plist_file)
+
+    try:
+        # Set up inotify
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        inotify_init = libc.inotify_init
+        inotify_add_watch = libc.inotify_add_watch
+        inotify_rm_watch = libc.inotify_rm_watch
+
+        fd = inotify_init()
+        if fd < 0:
+            print "inotify_init failed, falling back to polling"
+            plist_poller_thread()
+            return
+
+        # Watch the status directory
+        watch_mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+        wd = inotify_add_watch(fd, STATUS_PATH, watch_mask)
+        if wd < 0:
+            print "inotify_add_watch failed, falling back to polling"
+            os.close(fd)
+            plist_poller_thread()
+            return
+
+        print "inotify watching %s" % STATUS_PATH
+
+        # Event structure: 4 bytes wd, 4 bytes mask, 4 bytes cookie, 4 bytes len, then name
+        while True:
+            try:
+                # Use select to allow timeout for checking thread status
+                ready, _, _ = select.select([fd], [], [], 5.0)
+                if not ready:
+                    continue
+
+                # Read events
+                buf = os.read(fd, 4096)
+                if not buf:
+                    continue
+
+                offset = 0
+                while offset < len(buf):
+                    wd, mask, cookie, length = struct.unpack('iIII', buf[offset:offset+16])
+                    offset += 16
+                    if length > 0:
+                        name = buf[offset:offset+length].rstrip('\x00')
+                        offset += length
+
+                        # Check if it's a plist file
+                        if name.endswith('.avc.plist'):
+                            filepath = os.path.join(STATUS_PATH, name)
+                            if os.path.exists(filepath):
+                                print "File changed: %s" % name
+                                load_plist_to_cache(filepath)
+
+            except Exception as e:
+                print "inotify read error: %s" % e
+                time.sleep(1)
+
+    except Exception as e:
+        print "inotify setup failed: %s, falling back to polling" % e
+        plist_poller_thread()
+
+
+def plist_poller_thread():
+    """Fallback poller if inotify is not available."""
+    print "Using polling mode for plist files"
+    file_mtimes = {}
+
+    while True:
+        try:
+            plist_pattern = os.path.join(STATUS_PATH, '*.avc.plist')
+            for plist_file in glob.glob(plist_pattern):
+                try:
+                    mtime = os.path.getmtime(plist_file)
+                    if plist_file not in file_mtimes or file_mtimes[plist_file] != mtime:
+                        file_mtimes[plist_file] = mtime
+                        load_plist_to_cache(plist_file)
+                except OSError:
+                    pass
+            time.sleep(2)  # Poll every 2 seconds
+        except Exception as e:
+            print "Polling error: %s" % e
+            time.sleep(5)
+
+
+def lutron_listener_thread():
+    """Background thread that maintains persistent Lutron connection for real-time updates."""
+    print "Starting Lutron listener..."
+
+    # Get light address mappings
+    address_map = {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        query = """
+        SELECT le.addresses, z.name as zone, le.name as light_name
+        FROM LightEntities le
+        JOIN Zones z ON le.zoneID = z.id
+        WHERE le.entityType IN ('Dimmer', 'Switch')
+        """
+        cursor.execute(query)
+        for row in cursor.fetchall():
+            addr_str = row[0]
+            zone = row[1]
+            name = row[2]
+            if addr_str:
+                addr = addr_str.split(',')[0]
+                address_map[addr] = {'zone': zone, 'name': name}
+        conn.close()
+    except Exception as e:
+        print "Error loading light addresses: %s" % e
+
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(30)
+            sock.connect((LUTRON_HOST, LUTRON_PORT))
+            print "Connected to Lutron at %s:%d" % (LUTRON_HOST, LUTRON_PORT)
+
+            # Login sequence
+            time.sleep(0.3)
+            sock.recv(1024)
+            sock.send(LUTRON_USER + '\r\n')
+            time.sleep(0.2)
+            sock.recv(1024)
+            sock.send(LUTRON_PASS + '\r\n')
+            time.sleep(0.2)
+            sock.recv(1024)
+
+            # Query initial state for all addresses
+            for addr in address_map.keys():
+                try:
+                    sock.send('?OUTPUT,%s,1\r\n' % addr)
+                    time.sleep(0.05)
+                except:
+                    pass
+
+            # Now listen for updates
+            sock.settimeout(60)  # Longer timeout for listening
+            buffer = ''
+
+            while True:
+                try:
+                    data = sock.recv(1024)
+                    if not data:
+                        print "Lutron connection closed"
+                        break
+
+                    buffer += data
+
+                    # Process complete lines
+                    while '\r\n' in buffer:
+                        line, buffer = buffer.split('\r\n', 1)
+                        line = line.strip()
+
+                        # Parse output level updates: ~OUTPUT,<addr>,1,<level>
+                        if line.startswith('~OUTPUT,'):
+                            parts = line.split(',')
+                            if len(parts) >= 4:
+                                addr = parts[1]
+                                try:
+                                    level = float(parts[3])
+                                    if addr in address_map:
+                                        info = address_map[addr]
+                                        key = "%s_%s" % (info['zone'], info['name'])
+                                        key = key.replace(' ', '_').lower()
+                                        STATE_CACHE.update_light(key, {
+                                            'address': addr,
+                                            'zone': info['zone'],
+                                            'name': info['name'],
+                                            'level': level,
+                                            'is_on': level > 0
+                                        })
+                                        print "Light update: %s = %.1f%%" % (key, level)
+                                except ValueError:
+                                    pass
+
+                except socket.timeout:
+                    # Send a keepalive query
+                    try:
+                        if address_map:
+                            addr = list(address_map.keys())[0]
+                            sock.send('?OUTPUT,%s,1\r\n' % addr)
+                    except:
+                        break
+
+        except Exception as e:
+            print "Lutron listener error: %s" % e
+
+        print "Reconnecting to Lutron in 5 seconds..."
+        time.sleep(5)
+
 
 def discover_uis_port():
     """Discover UIS port via Avahi/Bonjour."""
@@ -308,12 +566,23 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def handle_lights_status(self):
-        """Return current light levels from Lutron."""
+        """Return current light levels from cache (populated by Lutron listener)."""
         try:
+            # Get cached light status
+            cached_lights = STATE_CACHE.get_lights()
+
+            if cached_lights:
+                # Return cached data
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'lights': cached_lights}))
+                return
+
+            # Fallback: query Lutron directly if cache is empty
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
-            # Get all light addresses
             query = """
             SELECT le.addresses, z.name as zone, le.name as light_name
             FROM LightEntities le
@@ -324,8 +593,7 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             rows = cursor.fetchall()
             conn.close()
 
-            # Build list of addresses to query
-            address_map = {}  # address -> (zone, name)
+            address_map = {}
             addresses = []
             for row in rows:
                 addr_str = row[0]
@@ -336,22 +604,22 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     addresses.append(addr)
                     address_map[addr] = {'zone': zone, 'name': name}
 
-            # Query Lutron for current levels
             levels = query_lutron_levels(addresses)
 
-            # Build response
             status = {}
             for addr, info in address_map.items():
                 key = "%s_%s" % (info['zone'], info['name'])
                 key = key.replace(' ', '_').lower()
                 level = levels.get(addr, 0)
-                status[key] = {
+                data = {
                     'address': addr,
                     'zone': info['zone'],
                     'name': info['name'],
                     'level': level,
                     'is_on': level > 0
                 }
+                status[key] = data
+                STATE_CACHE.update_light(key, data)
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -363,30 +631,17 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def handle_state(self):
-        """Return current state of all components from avc.plist files."""
+        """Return current state of all components from cache."""
         try:
-            components = {}
+            # Get cached component states
+            components = STATE_CACHE.get_components()
 
-            # Find all .avc.plist files
-            plist_pattern = os.path.join(STATUS_PATH, '*.avc.plist')
-            for plist_file in glob.glob(plist_pattern):
-                # Extract component name from filename
-                filename = os.path.basename(plist_file)
-                component_name = filename.replace('.avc.plist', '')
-
-                # Parse the plist and get states
-                states = parse_gnustep_plist(plist_file)
-
-                # Filter out non-state keys (like SavantHost*, login, password, etc)
-                filtered_states = {}
-                for key, value in states.items():
-                    # Skip internal/config keys
-                    if key.startswith('SavantHost') or key in ('login', 'password', 'ComponentProfileVersion', 'Version'):
-                        continue
-                    filtered_states[key] = value
-
-                if filtered_states:
-                    components[component_name] = filtered_states
+            # If cache is empty, load from files
+            if not components:
+                plist_pattern = os.path.join(STATUS_PATH, '*.avc.plist')
+                for plist_file in glob.glob(plist_pattern):
+                    load_plist_to_cache(plist_file)
+                components = STATE_CACHE.get_components()
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -472,6 +727,19 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
 def main():
+    # Start background threads for state watching
+    plist_thread = threading.Thread(target=plist_watcher_thread)
+    plist_thread.daemon = True
+    plist_thread.start()
+
+    lutron_thread = threading.Thread(target=lutron_listener_thread)
+    lutron_thread.daemon = True
+    lutron_thread.start()
+
+    # Give threads a moment to initialize
+    time.sleep(1)
+
+    # Start HTTP server
     server_address = ('0.0.0.0', LISTEN_PORT)
     httpd = BaseHTTPServer.HTTPServer(server_address, SavantRequestHandler)
     print "Savant REST Relay listening on port", LISTEN_PORT
