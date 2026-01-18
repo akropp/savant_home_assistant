@@ -1,4 +1,5 @@
 import logging
+from datetime import timedelta
 from typing import Optional
 
 from homeassistant.components.media_player import (
@@ -7,14 +8,13 @@ from homeassistant.components.media_player import (
     MediaPlayerDeviceClass,
 )
 from homeassistant.const import STATE_ON, STATE_OFF, STATE_IDLE
-from homeassistant.core import HomeAssistant
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polling interval in seconds
-SCAN_INTERVAL = 10
+# Polling interval
+SCAN_INTERVAL = timedelta(seconds=10)
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the Savant Media Player platform."""

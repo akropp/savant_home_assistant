@@ -25,7 +25,7 @@ class SavantClient:
             return self._zones
         except Exception as e:
             _LOGGER.error(f"Failed to get zones: {e}")
-            return []
+            return {}
 
     def get_lights(self):
         """Retrieve light entities from the REST Relay."""
