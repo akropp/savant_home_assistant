@@ -449,7 +449,48 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             cursor.execute(query)
             rows = cursor.fetchall()
+
+            # Also query for volume control services (SURROUNDSOUND and EQUALIZER)
+            volume_query = """
+            SELECT
+                zone,
+                component,
+                logicalComponent,
+                serviceVariantID,
+                serviceType
+            FROM ServiceImplementationZonedService
+            WHERE serviceType IN ('SVC_SETTINGS_SURROUNDSOUND', 'SVC_SETTINGS_EQUALIZER')
+            """
+            cursor.execute(volume_query)
+            volume_rows = cursor.fetchall()
             conn.close()
+
+            # Build volume control map per zone
+            # Priority: SURROUNDSOUND > EQUALIZER
+            zone_volume_control = {}
+            for row in volume_rows:
+                zone_name = row[0]
+                component = row[1]
+                logical = row[2]
+                variant_id = row[3]
+                svc_type = row[4]
+
+                # Only set if not already set with higher priority
+                if zone_name not in zone_volume_control:
+                    zone_volume_control[zone_name] = {
+                        'component': component,
+                        'logicalComponent': logical,
+                        'serviceVariantID': str(variant_id),
+                        'serviceType': svc_type
+                    }
+                elif svc_type == 'SVC_SETTINGS_SURROUNDSOUND':
+                    # SURROUNDSOUND takes priority over EQUALIZER
+                    zone_volume_control[zone_name] = {
+                        'component': component,
+                        'logicalComponent': logical,
+                        'serviceVariantID': str(variant_id),
+                        'serviceType': svc_type
+                    }
 
             zones = {}
             for row in rows:
@@ -462,7 +503,7 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 service = row[6]
 
                 if zone_name not in zones:
-                    zones[zone_name] = {'name': zone_name, 'services': []}
+                    zones[zone_name] = {'name': zone_name, 'services': [], 'volumeControl': None}
 
                 zones[zone_name]['services'].append({
                     'alias': alias,
@@ -472,6 +513,37 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     'serviceVariantID': str(variant_id),
                     'service': service
                 })
+
+            # Add volume control info to each zone
+            for zone_name, vol_info in zone_volume_control.items():
+                if zone_name in zones:
+                    # Determine state keys based on component type
+                    component = vol_info['component']
+                    logical = vol_info['logicalComponent']
+
+                    if vol_info['serviceType'] == 'SVC_SETTINGS_SURROUNDSOUND':
+                        # Receiver-based volume control
+                        vol_info['stateComponent'] = component
+                        vol_info['volumeStateKey'] = 'Volume_Current_Volume_MainZone'
+                        vol_info['muteStateKey'] = 'Mute_current_mute_Receiver'
+                        vol_info['powerStateKey'] = 'Power_current_power_Receiver'
+                        vol_info['volumeScale'] = 'percent'  # 0-100
+                    else:
+                        # Audio Switch - extract output number from logical component
+                        # AV_switch_N -> output N
+                        output_num = '1'
+                        if logical and '_' in logical:
+                            parts = logical.split('_')
+                            if parts[-1].isdigit():
+                                output_num = parts[-1]
+                        vol_info['stateComponent'] = component
+                        vol_info['volumeStateKey'] = 'Volume_current_volume_' + output_num
+                        vol_info['muteStateKey'] = 'Mute_current_mute_' + output_num
+                        vol_info['powerStateKey'] = 'Power_current_power_status'
+                        vol_info['volumeScale'] = 'dB'  # -80 to 0 dB
+                        vol_info['outputNumber'] = output_num
+
+                    zones[zone_name]['volumeControl'] = vol_info
 
             response_data = {'zones': zones}
 

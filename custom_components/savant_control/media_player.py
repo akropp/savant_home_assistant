@@ -61,30 +61,23 @@ class SavantMediaPlayer(MediaPlayerEntity):
 
         self._source_list = sorted(list(self._services.keys()))
 
-        # Priority list for volume control
-        volume_priorities = [
-            "SVC_SETTINGS_SURROUNDSOUND",
-            "SVC_SETTINGS_EQUALIZER",
-            "SVC_AV_TV",
-            "SVC_AV_SONOS",
-            "SVC_AV_LIVEMEDIAQUERY_SAVANTMEDIAAUDIO",
-            "SVC_AV_EXTERNALMEDIASERVER",
-        ]
+        # Volume control configuration from relay
+        self._volume_control = zone_data.get('volumeControl')
+        if self._volume_control:
+            _LOGGER.info(f"Zone {zone_name} volume control: {self._volume_control.get('component')} ({self._volume_control.get('serviceType')})")
+            # Add the volume control component to tracked components
+            if self._volume_control.get('stateComponent'):
+                self._components.add(self._volume_control['stateComponent'])
 
+        # Build volume service info for sending commands
         self._volume_service = None
-
-        # Check priorities in order
-        for priority in volume_priorities:
-            for alias, svc in self._services.items():
-                if priority in svc.get('type', '') or priority in svc.get('service', ''):
-                    self._volume_service = svc
-                    break
-            if self._volume_service:
-                break
-
-        # Fallback: use the first service
-        if not self._volume_service and self._services:
-            self._volume_service = list(self._services.values())[0]
+        if self._volume_control:
+            self._volume_service = {
+                'component': self._volume_control.get('component'),
+                'logicalComponent': self._volume_control.get('logicalComponent'),
+                'serviceVariantID': self._volume_control.get('serviceVariantID', '1'),
+                'type': self._volume_control.get('serviceType')
+            }
 
     @property
     def name(self):
@@ -135,34 +128,49 @@ class SavantMediaPlayer(MediaPlayerEntity):
         try:
             all_states = self._client.get_state()
 
-            # Check each component in this zone for power/volume/mute state
+            # Check power state from any component in the zone
             power_on = False
-            volume = None
-            muted = None
-
             for component_name in self._components:
                 if component_name in all_states:
                     states = all_states[component_name]
-
-                    # Check power state
                     for key, value in states.items():
                         key_lower = key.lower()
-                        if 'power' in key_lower:
-                            if str(value).upper() == 'ON':
-                                power_on = True
+                        if 'power' in key_lower and str(value).upper() == 'ON':
+                            power_on = True
+                            break
+                if power_on:
+                    break
 
-                        # Check volume (look for keys containing 'volume')
-                        if 'volume' in key_lower and 'rpm' not in key_lower:
-                            try:
-                                vol_val = int(value)
-                                # Assume 0-100 scale, convert to 0.0-1.0
-                                volume = min(1.0, max(0.0, vol_val / 100.0))
-                            except (ValueError, TypeError):
-                                pass
+            # Get volume/mute from the specific volume control component
+            volume = None
+            muted = None
 
-                        # Check mute state
-                        if 'mute' in key_lower:
-                            muted = str(value).upper() == 'ON'
+            if self._volume_control:
+                state_component = self._volume_control.get('stateComponent')
+                vol_key = self._volume_control.get('volumeStateKey')
+                mute_key = self._volume_control.get('muteStateKey')
+                vol_scale = self._volume_control.get('volumeScale', 'percent')
+
+                if state_component and state_component in all_states:
+                    states = all_states[state_component]
+
+                    # Get volume
+                    if vol_key and vol_key in states:
+                        try:
+                            vol_val = int(states[vol_key])
+                            if vol_scale == 'dB':
+                                # Audio Switch: dB scale (-80 to 0)
+                                # Convert to 0.0-1.0 (where -80dB = 0, 0dB = 1)
+                                volume = max(0.0, min(1.0, (vol_val + 80) / 80.0))
+                            else:
+                                # Receiver: percent scale (0-100)
+                                volume = max(0.0, min(1.0, vol_val / 100.0))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Get mute state
+                    if mute_key and mute_key in states:
+                        muted = str(states[mute_key]).upper() == 'ON'
 
             # Update state
             if power_on:
