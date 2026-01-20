@@ -99,6 +99,7 @@ class SavantRemote(RemoteEntity):
         self._is_on = True  # Remote is always "on"
         self._current_source = None
         self._current_source_service = None
+        self._is_muted = False  # Track mute state for toggle
 
         # Unique ID
         self._attr_unique_id = f"savant_remote_{zone_name}".replace(" ", "_").lower()
@@ -154,6 +155,10 @@ class SavantRemote(RemoteEntity):
                 f"service={self._current_source_service}"
             )
             self.async_write_ha_state()
+
+        # Track mute state for toggle logic
+        if "mute" in data:
+            self._is_muted = data["mute"] == "ON"
 
     @property
     def name(self) -> str:
@@ -238,6 +243,11 @@ class SavantRemote(RemoteEntity):
                 # Map common command names to Savant commands
                 savant_cmd = COMMAND_MAP.get(cmd.lower(), cmd)
 
+                # Handle mute toggle - Savant uses MuteOn/MuteOff, not MuteToggle
+                if savant_cmd == "MuteToggle":
+                    savant_cmd = "MuteOff" if self._is_muted else "MuteOn"
+                    self._is_muted = not self._is_muted  # Optimistic update
+
                 _LOGGER.debug(
                     f"Remote {self._zone_name}: Sending {savant_cmd} to "
                     f"{self._current_source}"
@@ -272,3 +282,6 @@ class SavantRemote(RemoteEntity):
                     if svc.get("type", "").startswith("SVC_AV_"):
                         self._current_source_service = svc
                         break
+
+        if "mute" in zone_state:
+            self._is_muted = zone_state["mute"] == "ON"
