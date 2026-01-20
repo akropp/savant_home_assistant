@@ -1,20 +1,20 @@
 """Savant Light platform for Home Assistant."""
 import logging
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ColorMode,
     LightEntity,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polling interval - not too aggressive to avoid overwhelming Savant
+# Polling interval - fallback, WebSocket provides real-time updates
 SCAN_INTERVAL = timedelta(seconds=30)
 
 
@@ -61,6 +61,54 @@ class SavantLight(LightEntity):
 
         # Unique ID
         self._attr_unique_id = f"savant_light_{self._zone}_{self._light_name}".replace(" ", "_").lower()
+
+        # WebSocket callback unregister function
+        self._unregister_callback: Optional[Callable] = None
+
+    async def async_added_to_hass(self) -> None:
+        """Register for WebSocket updates when entity is added."""
+        self._unregister_callback = self._client.register_callback(
+            self._handle_ws_update
+        )
+        _LOGGER.debug(f"Registered WebSocket callback for light {self._zone} {self._light_name}")
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unregister WebSocket callback when entity is removed."""
+        if self._unregister_callback:
+            self._unregister_callback()
+            self._unregister_callback = None
+
+    @callback
+    def _handle_ws_update(self, event_type: str, data: dict) -> None:
+        """Handle WebSocket state update."""
+        if event_type != "light_state":
+            return
+
+        # Check if this update is for our light (by address)
+        if str(data.get("address")) != str(self._address):
+            return
+
+        _LOGGER.debug(f"WebSocket update for light {self._zone} {self._light_name}: {data}")
+
+        updated = False
+
+        # Update brightness/state
+        if "level" in data:
+            level = data["level"]
+            new_is_on = level > 0
+            if self._is_on != new_is_on:
+                self._is_on = new_is_on
+                updated = True
+
+            if self._is_dimmer:
+                new_brightness = round(level * 255 / 100)
+                if self._brightness != new_brightness:
+                    self._brightness = new_brightness
+                    updated = True
+
+        # Trigger Home Assistant state update
+        if updated:
+            self.async_write_ha_state()
 
     @property
     def name(self) -> str:

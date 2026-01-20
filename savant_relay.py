@@ -14,12 +14,15 @@ import ctypes
 import struct
 import time
 import select
+import hashlib
+import base64
 
 # Config
 DB_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/serviceImplementation.sqlite'
 STATUS_PATH = '/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles'
 SAVANT_HOST = '127.0.0.1'
 LISTEN_PORT = 8081
+WEBSOCKET_PORT = 8082
 
 # Lutron config (from Lutron.avc.plist)
 LUTRON_HOST = '192.168.1.249'
@@ -41,6 +44,7 @@ class StateCache:
         self.lock = threading.Lock()
         self.component_states = {}  # component -> {state_key: value}
         self.light_levels = {}  # key -> {address, zone, name, level, is_on}
+        self.zone_states = {}  # zone -> {power, volume, mute}
         self.last_update = 0
 
     def update_component(self, component_name, states):
@@ -53,6 +57,24 @@ class StateCache:
             self.light_levels[key] = data
             self.last_update = time.time()
 
+    def update_zone_state(self, zone, key, value):
+        """Update a zone-level state (power, volume, mute) from syslog events."""
+        with self.lock:
+            if zone not in self.zone_states:
+                self.zone_states[zone] = {}
+            self.zone_states[zone][key] = value
+            self.last_update = time.time()
+
+    def get_zone_state(self, zone):
+        """Get cached zone state."""
+        with self.lock:
+            return self.zone_states.get(zone, {})
+
+    def get_all_zone_states(self):
+        """Get all cached zone states."""
+        with self.lock:
+            return dict(self.zone_states)
+
     def get_components(self):
         with self.lock:
             return dict(self.component_states)
@@ -62,6 +84,230 @@ class StateCache:
             return dict(self.light_levels)
 
 STATE_CACHE = StateCache()
+
+
+# WebSocket server for push notifications
+class WebSocketServer:
+    """Simple WebSocket server for Python 2.7."""
+
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, port):
+        self.port = port
+        self.clients = []
+        self.clients_lock = threading.Lock()
+        self.running = False
+
+    def start(self):
+        """Start the WebSocket server in a background thread."""
+        self.running = True
+        thread = threading.Thread(target=self._server_loop)
+        thread.daemon = True
+        thread.start()
+        print "WebSocket server started on port %d" % self.port
+
+    def _server_loop(self):
+        """Main server loop accepting connections."""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('0.0.0.0', self.port))
+        server_socket.listen(5)
+        server_socket.settimeout(1.0)
+
+        while self.running:
+            try:
+                client_socket, address = server_socket.accept()
+                print "WebSocket connection from %s" % str(address)
+                thread = threading.Thread(target=self._handle_client, args=(client_socket,))
+                thread.daemon = True
+                thread.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print "WebSocket accept error: %s" % e
+
+    def _handle_client(self, client_socket):
+        """Handle a single WebSocket client."""
+        try:
+            # Receive HTTP upgrade request
+            request = ""
+            while "\r\n\r\n" not in request:
+                data = client_socket.recv(1024)
+                if not data:
+                    return
+                request += data
+
+            # Parse headers
+            headers = {}
+            lines = request.split("\r\n")
+            for line in lines[1:]:
+                if ": " in line:
+                    key, value = line.split(": ", 1)
+                    headers[key.lower()] = value
+
+            # Check for WebSocket upgrade
+            if headers.get("upgrade", "").lower() != "websocket":
+                client_socket.close()
+                return
+
+            # Get the WebSocket key
+            ws_key = headers.get("sec-websocket-key", "")
+            if not ws_key:
+                client_socket.close()
+                return
+
+            # Calculate accept key
+            accept_key = base64.b64encode(
+                hashlib.sha1(ws_key + self.GUID).digest()
+            )
+
+            # Send handshake response
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: %s\r\n"
+                "\r\n"
+            ) % accept_key
+            client_socket.send(response)
+
+            # Add to clients list
+            with self.clients_lock:
+                self.clients.append(client_socket)
+
+            print "WebSocket client connected (total: %d)" % len(self.clients)
+
+            # Keep connection alive, handle ping/pong and detect disconnection
+            client_socket.settimeout(30.0)
+            while self.running:
+                try:
+                    data = client_socket.recv(2)
+                    if not data:
+                        break
+
+                    # Parse frame header
+                    first_byte = ord(data[0])
+                    second_byte = ord(data[1])
+                    opcode = first_byte & 0x0F
+                    masked = (second_byte & 0x80) != 0
+                    payload_len = second_byte & 0x7F
+
+                    # Read extended payload length if needed
+                    if payload_len == 126:
+                        ext = client_socket.recv(2)
+                        payload_len = struct.unpack(">H", ext)[0]
+                    elif payload_len == 127:
+                        ext = client_socket.recv(8)
+                        payload_len = struct.unpack(">Q", ext)[0]
+
+                    # Read mask key if masked
+                    mask_key = None
+                    if masked:
+                        mask_key = client_socket.recv(4)
+
+                    # Read payload
+                    payload = ""
+                    while len(payload) < payload_len:
+                        chunk = client_socket.recv(payload_len - len(payload))
+                        if not chunk:
+                            break
+                        payload += chunk
+
+                    # Unmask if needed
+                    if masked and mask_key:
+                        unmasked = ""
+                        for i, c in enumerate(payload):
+                            unmasked += chr(ord(c) ^ ord(mask_key[i % 4]))
+                        payload = unmasked
+
+                    # Handle opcodes
+                    if opcode == 0x8:  # Close
+                        break
+                    elif opcode == 0x9:  # Ping
+                        self._send_frame(client_socket, payload, 0xA)  # Pong
+                    elif opcode == 0xA:  # Pong
+                        pass  # Ignore pongs
+
+                except socket.timeout:
+                    # Send ping to keep connection alive
+                    try:
+                        self._send_frame(client_socket, "", 0x9)  # Ping
+                    except:
+                        break
+                except Exception as e:
+                    print "WebSocket client error: %s" % e
+                    break
+
+        except Exception as e:
+            print "WebSocket handler error: %s" % e
+
+        finally:
+            # Remove from clients list
+            with self.clients_lock:
+                if client_socket in self.clients:
+                    self.clients.remove(client_socket)
+            try:
+                client_socket.close()
+            except:
+                pass
+            print "WebSocket client disconnected (total: %d)" % len(self.clients)
+
+    def _send_frame(self, client_socket, data, opcode=0x1):
+        """Send a WebSocket frame."""
+        frame = ""
+        # First byte: FIN + opcode
+        frame += chr(0x80 | opcode)
+
+        # Second byte: payload length (no mask for server->client)
+        length = len(data)
+        if length < 126:
+            frame += chr(length)
+        elif length < 65536:
+            frame += chr(126) + struct.pack(">H", length)
+        else:
+            frame += chr(127) + struct.pack(">Q", length)
+
+        # Payload
+        frame += data
+        client_socket.send(frame)
+
+    def broadcast(self, message):
+        """Send a message to all connected clients."""
+        if isinstance(message, dict):
+            message = json.dumps(message)
+
+        with self.clients_lock:
+            dead_clients = []
+            for client in self.clients:
+                try:
+                    self._send_frame(client, message)
+                except Exception as e:
+                    print "Broadcast error: %s" % e
+                    dead_clients.append(client)
+
+            # Clean up dead clients
+            for client in dead_clients:
+                self.clients.remove(client)
+                try:
+                    client.close()
+                except:
+                    pass
+
+
+# Global WebSocket server instance
+WS_SERVER = None
+
+
+def broadcast_state_change(event_type, data):
+    """Broadcast a state change to all WebSocket clients."""
+    global WS_SERVER
+    if WS_SERVER:
+        message = {
+            "type": event_type,
+            "data": data,
+            "timestamp": time.time()
+        }
+        WS_SERVER.broadcast(message)
 
 
 def query_lutron_levels(addresses):
@@ -274,6 +520,125 @@ def plist_poller_thread():
             time.sleep(5)
 
 
+def syslog_watcher_thread():
+    """Background thread that watches /var/log/syslog for service events."""
+    print "Starting syslog watcher..."
+
+    syslog_path = '/var/log/syslog'
+
+    # Pattern to match service events
+    # Format: Received service event: Zone-Component-Logical-Variant-Service-Command with arguments: {args}
+    event_pattern = re.compile(
+        r'Received service event: ([^-]+)-([^-]+)-([^-]+)-(\d+)-([^-]+)-(\w+) with arguments: (.+?)>'
+    )
+
+    try:
+        # Open file and seek to end
+        f = open(syslog_path, 'r')
+        f.seek(0, 2)  # Seek to end
+        print "Watching syslog for service events"
+
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+
+            # Check for service event
+            match = event_pattern.search(line)
+            if match:
+                zone = match.group(1)
+                component = match.group(2)
+                logical = match.group(3)
+                variant = match.group(4)
+                service = match.group(5)
+                command = match.group(6)
+                args_str = match.group(7)
+
+                # Parse arguments (format: {key = value; key2 = value2; } or (null))
+                args = {}
+                if args_str and args_str != '(null)':
+                    # Remove braces and parse key=value pairs
+                    args_str = args_str.strip('{}')
+                    for pair in args_str.split(';'):
+                        pair = pair.strip()
+                        if '=' in pair:
+                            k, v = pair.split('=', 1)
+                            args[k.strip()] = v.strip()
+
+                print "Service event: %s/%s - %s %s" % (zone, component, command, args)
+
+                # Update state cache based on command and broadcast changes
+                if command == 'SetVolume' and 'VolumeValue' in args:
+                    try:
+                        vol = int(args['VolumeValue'])
+                        # Store in a zone-based cache for media player state
+                        STATE_CACHE.update_zone_state(zone, 'volume', vol)
+                        broadcast_state_change('zone_state', {
+                            'zone': zone,
+                            'volume': vol
+                        })
+                    except ValueError:
+                        pass
+
+                elif command == 'PowerOn':
+                    STATE_CACHE.update_zone_state(zone, 'power', 'ON')
+                    broadcast_state_change('zone_state', {
+                        'zone': zone,
+                        'power': 'ON'
+                    })
+
+                elif command == 'PowerOff':
+                    STATE_CACHE.update_zone_state(zone, 'power', 'OFF')
+                    broadcast_state_change('zone_state', {
+                        'zone': zone,
+                        'power': 'OFF'
+                    })
+
+                elif command == 'MuteOn':
+                    STATE_CACHE.update_zone_state(zone, 'mute', 'ON')
+                    broadcast_state_change('zone_state', {
+                        'zone': zone,
+                        'mute': 'ON'
+                    })
+
+                elif command == 'MuteOff':
+                    STATE_CACHE.update_zone_state(zone, 'mute', 'OFF')
+                    broadcast_state_change('zone_state', {
+                        'zone': zone,
+                        'mute': 'OFF'
+                    })
+
+                elif command == 'DimmerSet' and 'DimmerLevel' in args:
+                    try:
+                        level = float(args['DimmerLevel'])
+                        addr = args.get('Address1', '')
+                        if addr:
+                            # Update light state in cache
+                            # We need to find the light key by address
+                            for key, data in STATE_CACHE.get_lights().items():
+                                if data.get('address') == addr:
+                                    STATE_CACHE.update_light(key, {
+                                        'address': addr,
+                                        'zone': data.get('zone', ''),
+                                        'name': data.get('name', ''),
+                                        'level': level,
+                                        'is_on': level > 0
+                                    })
+                                    broadcast_state_change('light_state', {
+                                        'address': addr,
+                                        'level': level,
+                                        'is_on': level > 0
+                                    })
+                                    print "Light update from syslog: %s = %.1f%%" % (key, level)
+                                    break
+                    except (ValueError, KeyError):
+                        pass
+
+    except Exception as e:
+        print "Syslog watcher error: %s" % e
+
+
 def lutron_listener_thread():
     """Background thread that maintains persistent Lutron connection for real-time updates."""
     print "Starting Lutron listener..."
@@ -413,6 +778,8 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/zones':
             self.handle_zones()
+        elif self.path == '/zones/state':
+            self.handle_zones_state()
         elif self.path == '/lights':
             self.handle_lights()
         elif self.path == '/lights/status':
@@ -554,6 +921,20 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         except Exception as e:
             print "SQL Error:", e
+            self.send_error(500, str(e))
+
+    def handle_zones_state(self):
+        """Return real-time zone states from syslog event cache."""
+        try:
+            zone_states = STATE_CACHE.get_all_zone_states()
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'zones': zone_states}))
+
+        except Exception as e:
+            print "Zone state error:", e
             self.send_error(500, str(e))
 
     def handle_lights(self):
@@ -800,10 +1181,21 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
 def main():
+    global WS_SERVER
+
+    # Start WebSocket server for push notifications
+    WS_SERVER = WebSocketServer(WEBSOCKET_PORT)
+    WS_SERVER.start()
+
     # Start background threads for state watching
     plist_thread = threading.Thread(target=plist_watcher_thread)
     plist_thread.daemon = True
     plist_thread.start()
+
+    # Start syslog watcher for real-time service events
+    syslog_thread = threading.Thread(target=syslog_watcher_thread)
+    syslog_thread.daemon = True
+    syslog_thread.start()
 
     # Only start Lutron listener if enabled (disabled by default to avoid
     # blocking Savant's connection - Lutron only supports limited connections)

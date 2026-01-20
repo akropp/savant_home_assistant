@@ -1,6 +1,6 @@
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Callable
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -8,12 +8,13 @@ from homeassistant.components.media_player import (
     MediaPlayerDeviceClass,
 )
 from homeassistant.const import STATE_ON, STATE_OFF, STATE_IDLE
+from homeassistant.core import callback
 
 from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polling interval - not too aggressive to avoid overwhelming Savant
+# Polling interval - fallback, WebSocket provides real-time updates
 SCAN_INTERVAL = timedelta(seconds=30)
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -79,6 +80,61 @@ class SavantMediaPlayer(MediaPlayerEntity):
                 'type': self._volume_control.get('serviceType')
             }
 
+        # WebSocket callback unregister function
+        self._unregister_callback: Optional[Callable] = None
+
+    async def async_added_to_hass(self) -> None:
+        """Register for WebSocket updates when entity is added."""
+        self._unregister_callback = self._client.register_callback(
+            self._handle_ws_update
+        )
+        _LOGGER.debug(f"Registered WebSocket callback for {self._zone_name}")
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unregister WebSocket callback when entity is removed."""
+        if self._unregister_callback:
+            self._unregister_callback()
+            self._unregister_callback = None
+
+    @callback
+    def _handle_ws_update(self, event_type: str, data: dict) -> None:
+        """Handle WebSocket state update."""
+        if event_type != "zone_state":
+            return
+
+        # Check if this update is for our zone
+        if data.get("zone") != self._zone_name:
+            return
+
+        _LOGGER.debug(f"WebSocket update for {self._zone_name}: {data}")
+
+        updated = False
+
+        # Update power state
+        if "power" in data:
+            new_state = STATE_ON if data["power"] == "ON" else STATE_OFF
+            if self._state != new_state:
+                self._state = new_state
+                updated = True
+
+        # Update volume
+        if "volume" in data:
+            new_volume = max(0.0, min(1.0, data["volume"] / 100.0))
+            if self._volume_level != new_volume:
+                self._volume_level = new_volume
+                updated = True
+
+        # Update mute
+        if "mute" in data:
+            new_mute = data["mute"] == "ON"
+            if self._is_muted != new_mute:
+                self._is_muted = new_mute
+                updated = True
+
+        # Trigger Home Assistant state update
+        if updated:
+            self.async_write_ha_state()
+
     @property
     def name(self):
         return self._name
@@ -127,40 +183,58 @@ class SavantMediaPlayer(MediaPlayerEntity):
         """Fetch state from the relay."""
         try:
             all_states = self._client.get_state()
+            zone_states = self._client.get_zone_states()
 
-            # Check power state from any component in the zone
+            # First check real-time zone state from syslog events
+            zone_state = zone_states.get(self._zone_name, {})
+
+            # Power state: prefer real-time zone state, fallback to component state
             power_on = False
-            for component_name in self._components:
-                if component_name in all_states:
-                    states = all_states[component_name]
-                    for key, value in states.items():
-                        key_lower = key.lower()
-                        if 'power' in key_lower and str(value).upper() == 'ON':
-                            power_on = True
-                            break
-                if power_on:
-                    break
+            if 'power' in zone_state:
+                power_on = zone_state['power'] == 'ON'
+            else:
+                # Fallback: check power state from any component in the zone
+                for component_name in self._components:
+                    if component_name in all_states:
+                        states = all_states[component_name]
+                        for key, value in states.items():
+                            key_lower = key.lower()
+                            if 'power' in key_lower and str(value).upper() == 'ON':
+                                power_on = True
+                                break
+                    if power_on:
+                        break
 
-            # Get volume/mute from the specific volume control component
+            # Volume/mute: prefer real-time zone state, fallback to component state
             volume = None
             muted = None
 
-            if self._volume_control:
+            # Check real-time zone state first
+            if 'volume' in zone_state:
+                try:
+                    vol_val = int(zone_state['volume'])
+                    # Real-time events are typically 0-100 scale
+                    volume = max(0.0, min(1.0, vol_val / 100.0))
+                except (ValueError, TypeError):
+                    pass
+
+            if 'mute' in zone_state:
+                muted = zone_state['mute'] == 'ON'
+
+            # Fallback to component state if no real-time data
+            if volume is None and self._volume_control:
                 state_component = self._volume_control.get('stateComponent')
                 vol_key = self._volume_control.get('volumeStateKey')
-                mute_key = self._volume_control.get('muteStateKey')
                 vol_scale = self._volume_control.get('volumeScale', 'percent')
 
                 if state_component and state_component in all_states:
                     states = all_states[state_component]
 
-                    # Get volume
                     if vol_key and vol_key in states:
                         try:
                             vol_val = int(states[vol_key])
                             if vol_scale == 'dB':
                                 # Audio Switch: dB scale (-80 to 0)
-                                # Convert to 0.0-1.0 (where -80dB = 0, 0dB = 1)
                                 volume = max(0.0, min(1.0, (vol_val + 80) / 80.0))
                             else:
                                 # Receiver: percent scale (0-100)
@@ -168,7 +242,12 @@ class SavantMediaPlayer(MediaPlayerEntity):
                         except (ValueError, TypeError):
                             pass
 
-                    # Get mute state
+            if muted is None and self._volume_control:
+                state_component = self._volume_control.get('stateComponent')
+                mute_key = self._volume_control.get('muteStateKey')
+
+                if state_component and state_component in all_states:
+                    states = all_states[state_component]
                     if mute_key and mute_key in states:
                         muted = str(states[mute_key]).upper() == 'ON'
 
