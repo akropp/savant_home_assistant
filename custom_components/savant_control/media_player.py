@@ -181,7 +181,8 @@ class SavantMediaPlayer(MediaPlayerEntity):
         )
         if self._volume_service:
             features |= (
-                MediaPlayerEntityFeature.VOLUME_STEP
+                MediaPlayerEntityFeature.VOLUME_SET
+                | MediaPlayerEntityFeature.VOLUME_STEP
                 | MediaPlayerEntityFeature.VOLUME_MUTE
             )
         return features
@@ -284,7 +285,7 @@ class SavantMediaPlayer(MediaPlayerEntity):
         except Exception as e:
             _LOGGER.error(f"Error updating state for {self._name}: {e}")
 
-    def _send_service_command(self, service_info, command):
+    def _send_service_command(self, service_info, command, arguments=None):
         """Send a command for a service."""
         self._client.send_command(
             zone=self._zone_name,
@@ -292,7 +293,8 @@ class SavantMediaPlayer(MediaPlayerEntity):
             logical_component=service_info.get('logicalComponent', ''),
             service=service_info.get('type', ''),
             variant_id=service_info.get('serviceVariantID', '1'),
-            command=command
+            command=command,
+            arguments=arguments
         )
 
     def turn_on(self):
@@ -329,6 +331,29 @@ class SavantMediaPlayer(MediaPlayerEntity):
         if self._volume_service:
             cmd = "MuteOn" if mute else "MuteOff"
             self._send_service_command(self._volume_service, cmd)
+
+    def set_volume_level(self, volume):
+        """Set volume level (0.0 to 1.0)."""
+        if not self._volume_service:
+            return
+
+        # Convert HA volume (0-1) to Savant volume
+        vol_scale = self._volume_control.get('volumeScale', 'percent') if self._volume_control else 'percent'
+
+        if vol_scale == 'dB':
+            # dB scale: -80 (min) to 0 (max)
+            # HA 0.0 -> -80dB, HA 1.0 -> 0dB
+            savant_volume = int(-80 + (volume * 80))
+        else:
+            # Percent scale: 0 to 100
+            savant_volume = int(volume * 100)
+
+        self._send_service_command(
+            self._volume_service,
+            "SetVolume",
+            {"VolumeValue": str(savant_volume)}
+        )
+        self._volume_level = volume
 
     def select_source(self, source):
         """Select input source."""
