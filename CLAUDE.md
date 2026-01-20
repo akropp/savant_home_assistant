@@ -62,11 +62,42 @@ curl http://192.168.1.218:8081/state
 - **Lutron integration**: Lights are controlled via Lutron RadioRA2 at 192.168.1.249:23 (credentials: lutron/integration)
 - **UIS port is dynamic**: Discovered via Avahi (`_uis_Kropp_ssp._udp`), falls back to 45600
 
+## Architecture Rule: Smart Relay
+
+**The relay is the "smart" abstraction layer; the HA integration is a thin client.**
+
+This means:
+- **Relay responsibilities:**
+  - All Savant-specific knowledge (database schema, plist formats, command syntax)
+  - Volume scale conversion (dB ↔ percent) - API always uses 0-100 scale
+  - Output number handling for Audio Switch (internal detail)
+  - Component-to-zone mapping
+  - State normalization (consistent format regardless of source component)
+  - WebSocket broadcasts with normalized data
+
+- **HA integration responsibilities:**
+  - Map relay API to Home Assistant entities
+  - Entity state management and UI
+  - Call relay endpoints with simple, normalized parameters
+  - NO Savant-specific logic (no dB conversion, no output numbers, no component knowledge)
+
+**Rationale:**
+1. Relay has direct access to Savant data (database, plists, syslog)
+2. Clean relay API is reusable by other clients beyond HA
+3. Simpler HA integration = easier maintenance
+4. Savant-specific changes stay contained in the relay
+
+**API contract:**
+- Volumes: Always 0-100 (relay converts dB internally)
+- Commands: Use logical names (zone, source) not internal IDs
+- State: Normalized JSON with consistent field names
+
 ## Relay API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/zones` | GET | All zones and services from SQLite |
+| `/zones/state` | GET | Real-time zone states (power, volume 0-100, mute, source) |
 | `/lights` | GET | Light entities with address/type info |
 | `/lights/status` | GET | Real-time light levels (from cache) |
 | `/state` | GET | Component states from cached plist data |

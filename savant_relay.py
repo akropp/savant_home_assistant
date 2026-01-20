@@ -45,6 +45,7 @@ class StateCache:
         self.component_states = {}  # component -> {state_key: value}
         self.light_levels = {}  # key -> {address, zone, name, level, is_on}
         self.zone_states = {}  # zone -> {power, volume, mute}
+        self.zone_volume_configs = {}  # zone -> volume config (scale, etc.)
         self.last_update = 0
 
     def update_component(self, component_name, states):
@@ -56,6 +57,16 @@ class StateCache:
         with self.lock:
             self.light_levels[key] = data
             self.last_update = time.time()
+
+    def set_zone_volume_config(self, zone, config):
+        """Store volume configuration for a zone."""
+        with self.lock:
+            self.zone_volume_configs[zone] = config
+
+    def get_zone_volume_config(self, zone):
+        """Get volume configuration for a zone."""
+        with self.lock:
+            return self.zone_volume_configs.get(zone, {})
 
     def update_zone_state(self, zone, key, value):
         """Update a zone-level state (power, volume, mute) from syslog events."""
@@ -84,6 +95,53 @@ class StateCache:
             return dict(self.light_levels)
 
 STATE_CACHE = StateCache()
+
+
+def normalize_volume(native_value, scale):
+    """Convert native volume value to normalized 0-100 scale.
+
+    Args:
+        native_value: Volume in native scale (dB or percent)
+        scale: 'dB' (range -80 to 0) or 'percent' (range 0-100)
+
+    Returns:
+        Volume as 0-100 integer
+    """
+    try:
+        val = float(native_value)
+        if scale == 'dB':
+            # dB scale: -80 = 0%, 0 = 100%
+            normalized = max(0, min(100, (val + 80) * 100 / 80))
+        else:
+            # Percent scale: already 0-100
+            normalized = max(0, min(100, val))
+        return int(round(normalized))
+    except (ValueError, TypeError):
+        return 0
+
+
+def denormalize_volume(normalized_value, scale):
+    """Convert normalized 0-100 volume to native scale.
+
+    Args:
+        normalized_value: Volume as 0-100
+        scale: 'dB' (range -80 to 0) or 'percent' (range 0-100)
+
+    Returns:
+        Volume in native scale
+    """
+    try:
+        val = float(normalized_value)
+        val = max(0, min(100, val))  # Clamp to 0-100
+        if scale == 'dB':
+            # 0% = -80dB, 100% = 0dB
+            native = -80 + (val * 80 / 100)
+            return int(round(native))
+        else:
+            # Percent scale: already 0-100
+            return int(round(val))
+    except (ValueError, TypeError):
+        return 0
 
 
 # WebSocket server for push notifications
@@ -571,12 +629,16 @@ def syslog_watcher_thread():
                 # Update state cache based on command and broadcast changes
                 if command == 'SetVolume' and 'VolumeValue' in args:
                     try:
-                        vol = int(args['VolumeValue'])
-                        # Store in a zone-based cache for media player state
-                        STATE_CACHE.update_zone_state(zone, 'volume', vol)
+                        native_vol = int(args['VolumeValue'])
+                        # Normalize volume to 0-100 scale based on zone's volume config
+                        vol_config = STATE_CACHE.get_zone_volume_config(zone)
+                        scale = vol_config.get('volumeScale', 'percent')
+                        normalized_vol = normalize_volume(native_vol, scale)
+                        # Store normalized volume in zone state
+                        STATE_CACHE.update_zone_state(zone, 'volume', normalized_vol)
                         broadcast_state_change('zone_state', {
                             'zone': zone,
-                            'volume': vol
+                            'volume': normalized_vol
                         })
                     except ValueError:
                         pass
@@ -587,19 +649,37 @@ def syslog_watcher_thread():
 
                     # Try to get current volume from plist cache for this zone
                     volume = None
+                    vol_config = STATE_CACHE.get_zone_volume_config(zone)
+                    scale = vol_config.get('volumeScale', 'percent')
+                    state_component = vol_config.get('stateComponent')
+                    vol_key = vol_config.get('volumeStateKey')
+
                     component_states = STATE_CACHE.get_components()
-                    # Look for volume in the component that just powered on
-                    if component in component_states:
+
+                    # First try the configured volume state component/key
+                    if state_component and vol_key and state_component in component_states:
+                        comp_state = component_states[state_component]
+                        if vol_key in comp_state:
+                            try:
+                                native_vol = int(comp_state[vol_key])
+                                volume = normalize_volume(native_vol, scale)
+                            except (ValueError, TypeError):
+                                pass
+
+                    # Fallback: look for volume in the component that just powered on
+                    if volume is None and component in component_states:
                         comp_state = component_states[component]
-                        # Try common volume state keys
                         for key in comp_state:
                             if 'volume' in key.lower() and 'current' in key.lower():
                                 try:
-                                    volume = int(comp_state[key])
-                                    STATE_CACHE.update_zone_state(zone, 'volume', volume)
+                                    native_vol = int(comp_state[key])
+                                    volume = normalize_volume(native_vol, scale)
                                     break
                                 except (ValueError, TypeError):
                                     pass
+
+                    if volume is not None:
+                        STATE_CACHE.update_zone_state(zone, 'volume', volume)
 
                     broadcast_data = {
                         'zone': zone,
@@ -792,6 +872,87 @@ def discover_uis_port():
 
 SAVANT_UIS_PORT = discover_uis_port()
 
+
+def load_zone_volume_configs():
+    """Load zone volume configurations from database into cache.
+
+    This should be called at startup so syslog watcher can normalize volumes
+    before any /zones API call.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        volume_query = """
+        SELECT
+            zone,
+            component,
+            logicalComponent,
+            serviceVariantID,
+            serviceType
+        FROM ServiceImplementationZonedService
+        WHERE serviceType IN ('SVC_SETTINGS_SURROUNDSOUND', 'SVC_SETTINGS_EQUALIZER')
+        """
+        cursor.execute(volume_query)
+        volume_rows = cursor.fetchall()
+        conn.close()
+
+        # Build volume control map per zone (SURROUNDSOUND takes priority)
+        zone_volume_control = {}
+        for row in volume_rows:
+            zone_name = row[0]
+            component = row[1]
+            logical = row[2]
+            variant_id = row[3]
+            svc_type = row[4]
+
+            if zone_name not in zone_volume_control:
+                zone_volume_control[zone_name] = {
+                    'component': component,
+                    'logicalComponent': logical,
+                    'serviceVariantID': str(variant_id),
+                    'serviceType': svc_type
+                }
+            elif svc_type == 'SVC_SETTINGS_SURROUNDSOUND':
+                zone_volume_control[zone_name] = {
+                    'component': component,
+                    'logicalComponent': logical,
+                    'serviceVariantID': str(variant_id),
+                    'serviceType': svc_type
+                }
+
+        # Add state keys and store in cache
+        for zone_name, vol_info in zone_volume_control.items():
+            logical = vol_info['logicalComponent']
+
+            if vol_info['serviceType'] == 'SVC_SETTINGS_SURROUNDSOUND':
+                vol_info['stateComponent'] = vol_info['component']
+                vol_info['volumeStateKey'] = 'Volume_Current_Volume_MainZone'
+                vol_info['muteStateKey'] = 'Mute_current_mute_Receiver'
+                vol_info['powerStateKey'] = 'Power_current_power_Receiver'
+                vol_info['volumeScale'] = 'percent'
+            else:
+                output_num = '1'
+                if logical and '_' in logical:
+                    parts = logical.split('_')
+                    if parts[-1].isdigit():
+                        output_num = parts[-1]
+                vol_info['stateComponent'] = vol_info['component']
+                vol_info['volumeStateKey'] = 'Volume_current_volume_' + output_num
+                vol_info['muteStateKey'] = 'Mute_current_mute_' + output_num
+                vol_info['powerStateKey'] = 'Power_current_power_status'
+                vol_info['volumeScale'] = 'dB'
+                vol_info['outputNumber'] = output_num
+
+            STATE_CACHE.set_zone_volume_config(zone_name, vol_info)
+            print "Loaded volume config for zone '%s': scale=%s" % (
+                zone_name, vol_info['volumeScale']
+            )
+
+    except Exception as e:
+        print "Error loading zone volume configs: %s" % e
+
+
 # SOAP template for service commands
 SOAP_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:SOAP-ENC="http://www.w3.org/2003/05/soap-encoding" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:wsdl="http://tempuri.org/wsdl.xsd" xmlns:md="urn:rpm-metadatainterface" xmlns:ctl="urn:rpm-controlinterface" xmlns:rdm="urn:rpm-rdminterface" xmlns:rpm="urn:rpm-common" xmlns:sm="urn:rpm-stateManagementInterface" xmlns:smrdm="urn:sm-rdminterface" xmlns:snsr="urn:rpm-userSNSRInterface" xmlns:sync="urn:rpm-syncinterface"><SOAP-ENV:Body><ctl:serviceEventRequest><zoneString>{zone}</zoneString><componentString>{component}</componentString><logicalComponentString>{logical}</logicalComponentString><serviceString>{service}</serviceString><serviceVariantIDString>{variant}</serviceVariantIDString><commandString>{command}</commandString>{args}</ctl:serviceEventRequest></SOAP-ENV:Body></SOAP-ENV:Envelope>"""
@@ -933,6 +1094,8 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         vol_info['outputNumber'] = output_num
 
                     zones[zone_name]['volumeControl'] = vol_info
+                    # Store volume config in cache for syslog normalization
+                    STATE_CACHE.set_zone_volume_config(zone_name, vol_info)
 
             response_data = {'zones': zones}
 
@@ -1161,6 +1324,18 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.send_error(400, "Missing required fields")
                 return
 
+            # Convert normalized volume (0-100) to native scale for SetVolume commands
+            if command == 'SetVolume' and 'VolumeValue' in arguments:
+                vol_config = STATE_CACHE.get_zone_volume_config(zone)
+                scale = vol_config.get('volumeScale', 'percent')
+                try:
+                    normalized_vol = int(arguments['VolumeValue'])
+                    native_vol = denormalize_volume(normalized_vol, scale)
+                    arguments['VolumeValue'] = str(native_vol)
+                    print "Volume conversion: %d (0-100) -> %d (%s)" % (normalized_vol, native_vol, scale)
+                except (ValueError, TypeError):
+                    pass
+
             # Build args XML
             args_xml = ''
             for name, value in arguments.items():
@@ -1204,6 +1379,9 @@ class SavantRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
 def main():
     global WS_SERVER
+
+    # Load zone volume configurations before starting watchers
+    load_zone_volume_configs()
 
     # Start WebSocket server for push notifications
     WS_SERVER = WebSocketServer(WEBSOCKET_PORT)

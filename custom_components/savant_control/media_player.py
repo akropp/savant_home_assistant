@@ -217,51 +217,20 @@ class SavantMediaPlayer(MediaPlayerEntity):
                     if power_on:
                         break
 
-            # Volume/mute: prefer real-time zone state, fallback to component state
+            # Volume/mute from zone state (relay provides normalized 0-100 volume)
             volume = None
             muted = None
 
-            # Check real-time zone state first
             if 'volume' in zone_state:
                 try:
                     vol_val = int(zone_state['volume'])
-                    # Real-time events are typically 0-100 scale
+                    # Relay normalizes all volumes to 0-100 scale
                     volume = max(0.0, min(1.0, vol_val / 100.0))
                 except (ValueError, TypeError):
                     pass
 
             if 'mute' in zone_state:
                 muted = zone_state['mute'] == 'ON'
-
-            # Fallback to component state if no real-time data
-            if volume is None and self._volume_control:
-                state_component = self._volume_control.get('stateComponent')
-                vol_key = self._volume_control.get('volumeStateKey')
-                vol_scale = self._volume_control.get('volumeScale', 'percent')
-
-                if state_component and state_component in all_states:
-                    states = all_states[state_component]
-
-                    if vol_key and vol_key in states:
-                        try:
-                            vol_val = int(states[vol_key])
-                            if vol_scale == 'dB':
-                                # Audio Switch: dB scale (-80 to 0)
-                                volume = max(0.0, min(1.0, (vol_val + 80) / 80.0))
-                            else:
-                                # Receiver: percent scale (0-100)
-                                volume = max(0.0, min(1.0, vol_val / 100.0))
-                        except (ValueError, TypeError):
-                            pass
-
-            if muted is None and self._volume_control:
-                state_component = self._volume_control.get('stateComponent')
-                mute_key = self._volume_control.get('muteStateKey')
-
-                if state_component and state_component in all_states:
-                    states = all_states[state_component]
-                    if mute_key and mute_key in states:
-                        muted = str(states[mute_key]).upper() == 'ON'
 
             # Update state
             if power_on:
@@ -337,16 +306,9 @@ class SavantMediaPlayer(MediaPlayerEntity):
         if not self._volume_service:
             return
 
-        # Convert HA volume (0-1) to Savant volume
-        vol_scale = self._volume_control.get('volumeScale', 'percent') if self._volume_control else 'percent'
-
-        if vol_scale == 'dB':
-            # dB scale: -80 (min) to 0 (max)
-            # HA 0.0 -> -80dB, HA 1.0 -> 0dB
-            savant_volume = int(-80 + (volume * 80))
-        else:
-            # Percent scale: 0 to 100
-            savant_volume = int(volume * 100)
+        # Convert HA volume (0-1) to relay's normalized 0-100 scale
+        # The relay handles conversion to native scale (dB, percent, etc.)
+        savant_volume = int(volume * 100)
 
         self._send_service_command(
             self._volume_service,
