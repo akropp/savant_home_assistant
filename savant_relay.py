@@ -583,10 +583,32 @@ def syslog_watcher_thread():
 
                 elif command == 'PowerOn':
                     STATE_CACHE.update_zone_state(zone, 'power', 'ON')
-                    broadcast_state_change('zone_state', {
+                    STATE_CACHE.update_zone_state(zone, 'source', component)
+
+                    # Try to get current volume from plist cache for this zone
+                    volume = None
+                    component_states = STATE_CACHE.get_components()
+                    # Look for volume in the component that just powered on
+                    if component in component_states:
+                        comp_state = component_states[component]
+                        # Try common volume state keys
+                        for key in comp_state:
+                            if 'volume' in key.lower() and 'current' in key.lower():
+                                try:
+                                    volume = int(comp_state[key])
+                                    STATE_CACHE.update_zone_state(zone, 'volume', volume)
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+
+                    broadcast_data = {
                         'zone': zone,
-                        'power': 'ON'
-                    })
+                        'power': 'ON',
+                        'source': component
+                    }
+                    if volume is not None:
+                        broadcast_data['volume'] = volume
+                    broadcast_state_change('zone_state', broadcast_data)
 
                 elif command == 'PowerOff':
                     STATE_CACHE.update_zone_state(zone, 'power', 'OFF')

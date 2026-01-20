@@ -131,6 +131,17 @@ class SavantMediaPlayer(MediaPlayerEntity):
                 self._is_muted = new_mute
                 updated = True
 
+        # Update source - component name from syslog matches service alias
+        if "source" in data:
+            new_source = data["source"]
+            # Find matching service alias for this component
+            for alias, svc in self._services.items():
+                if svc.get('component') == new_source:
+                    if self._source != alias:
+                        self._source = alias
+                        updated = True
+                    break
+
         # Trigger Home Assistant state update
         if updated:
             self.async_write_ha_state()
@@ -261,6 +272,14 @@ class SavantMediaPlayer(MediaPlayerEntity):
                 self._volume_level = volume
             if muted is not None:
                 self._is_muted = muted
+
+            # Source: get from zone state (component name -> alias)
+            if 'source' in zone_state:
+                source_component = zone_state['source']
+                for alias, svc in self._services.items():
+                    if svc.get('component') == source_component:
+                        self._source = alias
+                        break
 
         except Exception as e:
             _LOGGER.error(f"Error updating state for {self._name}: {e}")
