@@ -54,6 +54,7 @@ COMMAND_MAP = {
     "9": "Digit9",
     # Other
     "mute": "MuteToggle",
+    "volume_mute": "MuteToggle",
     "volume_up": "VolumeUp",
     "volume_down": "VolumeDown",
     "exit": "Exit",
